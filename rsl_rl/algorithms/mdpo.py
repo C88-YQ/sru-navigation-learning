@@ -107,9 +107,17 @@ class MDPO:
         desired_kl: float = 0.01,
         device: str = "cpu",
         use_muon: bool = True,
+        multi_gpu_cfg: dict | None = None,
         **kwargs,
     ):
         self.device = device
+        self.is_multi_gpu = multi_gpu_cfg is not None
+        if multi_gpu_cfg is not None:
+            self.gpu_global_rank = multi_gpu_cfg["global_rank"]
+            self.gpu_world_size = multi_gpu_cfg["world_size"]
+        else:
+            self.gpu_global_rank = 0
+            self.gpu_world_size = 1
 
         # Learning rate configuration
         self.schedule = schedule
@@ -528,6 +536,9 @@ class MDPO:
             self.optimizer_2.zero_grad(set_to_none=True)
             total_loss.backward()
 
+            if self.is_multi_gpu:
+                self.reduce_parameters()
+
             # Clip gradients
             nn.utils.clip_grad_norm_(self.actor_critic_1.get_actor_parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.actor_critic_2.get_actor_parameters(), self.max_grad_norm)
@@ -552,3 +563,29 @@ class MDPO:
         self.storage_2.clear()
 
         return mean_value_loss, mean_surrogate_loss, mean_kl_divergence
+
+    def broadcast_parameters(self):
+        """Broadcast model parameters from rank-0 to all ranks."""
+        model_params = [self.actor_critic_1.state_dict(), self.actor_critic_2.state_dict()]
+        torch.distributed.broadcast_object_list(model_params, src=0)
+        self.actor_critic_1.load_state_dict(model_params[0])
+        self.actor_critic_2.load_state_dict(model_params[1])
+
+    def reduce_parameters(self):
+        """Synchronize and average gradients across all ranks."""
+        grads_1 = [param.grad.view(-1) for param in self.actor_critic_1.parameters() if param.grad is not None]
+        grads_2 = [param.grad.view(-1) for param in self.actor_critic_2.parameters() if param.grad is not None]
+        grads = grads_1 + grads_2
+        if not grads:
+            return
+
+        all_grads = torch.cat(grads)
+        torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
+        all_grads /= self.gpu_world_size
+
+        offset = 0
+        for param in list(self.actor_critic_1.parameters()) + list(self.actor_critic_2.parameters()):
+            if param.grad is not None:
+                numel = param.numel()
+                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
+                offset += numel

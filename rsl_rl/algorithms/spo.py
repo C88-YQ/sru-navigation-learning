@@ -32,10 +32,18 @@ class SPO:
         schedule="fixed",
         desired_kl=0.01,
         device="cpu",
+        multi_gpu_cfg: dict | None = None,
         **kwargs,
 
     ):
         self.device = device
+        self.is_multi_gpu = multi_gpu_cfg is not None
+        if multi_gpu_cfg is not None:
+            self.gpu_global_rank = multi_gpu_cfg["global_rank"]
+            self.gpu_world_size = multi_gpu_cfg["world_size"]
+        else:
+            self.gpu_global_rank = 0
+            self.gpu_world_size = 1
 
         self.desired_kl = desired_kl
         self.schedule = schedule
@@ -163,6 +171,9 @@ class SPO:
             # Gradient step
             self.optimizer.zero_grad()
             loss.backward()
+
+            if self.is_multi_gpu:
+                self.reduce_parameters()
             
             # Clip the gradients for actor and critic separately
             nn.utils.clip_grad_norm_(self.actor_critic.get_actor_parameters(), self.max_grad_norm)
@@ -179,3 +190,25 @@ class SPO:
         self.storage.clear()
 
         return mean_value_loss, mean_surrogate_loss
+
+    def broadcast_parameters(self):
+        """Broadcast model parameters from rank-0 to all ranks."""
+        model_params = [self.actor_critic.state_dict()]
+        torch.distributed.broadcast_object_list(model_params, src=0)
+        self.actor_critic.load_state_dict(model_params[0])
+
+    def reduce_parameters(self):
+        """Synchronize and average gradients across all ranks."""
+        grads = [param.grad.view(-1) for param in self.actor_critic.parameters() if param.grad is not None]
+        if not grads:
+            return
+        all_grads = torch.cat(grads)
+        torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
+        all_grads /= self.gpu_world_size
+
+        offset = 0
+        for param in self.actor_critic.parameters():
+            if param.grad is not None:
+                numel = param.numel()
+                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
+                offset += numel

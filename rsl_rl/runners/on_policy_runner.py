@@ -35,6 +35,9 @@ class OnPolicyRunner:
         self.device = device
         self.env = env
 
+        # check if multi-gpu is enabled
+        self._configure_multi_gpu()
+
         # Video recording (initialized lazily, enabled via set_video_recording)
         self.video_recorder: VideoRecorder | None = None
 
@@ -61,13 +64,15 @@ class OnPolicyRunner:
             actor_critic_2: ActorCritic | ActorCriticRecurrent | ActorCriticSRU = actor_critic_class(
                 num_obs, num_critic_obs, self.env.num_actions, **self.policy_cfg
             ).to(self.device)
-            self.alg = alg_class(actor_critic_1, actor_critic_2, device=self.device, **self.alg_cfg)
+            self.alg = alg_class(
+                actor_critic_1, actor_critic_2, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
+            )
         else:
             # Standard algorithms use one actor-critic
             actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticSRU = actor_critic_class(
                 num_obs, num_critic_obs, self.env.num_actions, **self.policy_cfg
             ).to(self.device)
-            self.alg = alg_class(actor_critic, device=self.device, **self.alg_cfg)
+            self.alg = alg_class(actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
 
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
@@ -88,6 +93,8 @@ class OnPolicyRunner:
             [self.env.num_actions],
         )
 
+        self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
+
         # Log
         self.log_dir = log_dir
         self.writer = None
@@ -104,24 +111,29 @@ class OnPolicyRunner:
             init_at_random_ep_len: If True, randomize initial episode lengths.
         """
         # initialize writer
-        if self.log_dir is not None and self.writer is None:
+        if self.log_dir is not None and self.writer is None and not self.disable_logs:
             self.logger_type = self.cfg.get("logger", "tensorboard")
-            self.logger_type = self.logger_type.lower()
-
-            if self.logger_type == "neptune":
-                from rsl_rl.utils.neptune_utils import NeptuneSummaryWriter
-
-                self.writer = NeptuneSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
-                self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
-            elif self.logger_type == "wandb":
-                from rsl_rl.utils.wandb_utils import WandbSummaryWriter
-
-                self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
-                self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
-            elif self.logger_type == "tensorboard":
-                self.writer = TensorboardSummaryWriter(log_dir=self.log_dir, flush_secs=10)
+            
+            # Allow None to disable logging (useful for distributed training on non-main processes)
+            if self.logger_type is None:
+                self.writer = None
             else:
-                raise AssertionError("logger type not found")
+                self.logger_type = self.logger_type.lower()
+
+                if self.logger_type == "neptune":
+                    from rsl_rl.utils.neptune_utils import NeptuneSummaryWriter
+
+                    self.writer = NeptuneSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+                    self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
+                elif self.logger_type == "wandb":
+                    from rsl_rl.utils.wandb_utils import WandbSummaryWriter
+
+                    self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+                    self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
+                elif self.logger_type == "tensorboard":
+                    self.writer = TensorboardSummaryWriter(log_dir=self.log_dir, flush_secs=10)
+                else:
+                    raise AssertionError(f"logger type '{self.logger_type}' not found")
 
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(
@@ -131,6 +143,10 @@ class OnPolicyRunner:
         critic_obs = extras["observations"].get("critic", obs)
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
         self.train_mode()
+
+        if self.is_distributed:
+            print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
+            self.alg.broadcast_parameters()
 
         ep_infos = []
         rewbuffer = deque(maxlen=100)
@@ -227,27 +243,29 @@ class OnPolicyRunner:
             # reset dropout masks
             self.alg.reset_dropout_masks()
 
-            if self.log_dir is not None:
+            if self.log_dir is not None and not self.disable_logs:
                 self.log(locals())
 
                 # Log video only if recording is complete (reached video_length frames)
                 if self.video_recorder and self.video_recorder.is_recording and self.video_recorder.is_complete():
                     self.video_recorder.log_video(self.writer, it, self.logger_type)
 
-            if it % self.save_interval == 0:
+            if it % self.save_interval == 0 and self.log_dir is not None and not self.disable_logs:
                 self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
             ep_infos.clear()
-            if it == start_iter:
+            if it == start_iter and not self.disable_logs:
                 git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
-                if self.logger_type in ["wandb", "neptune"] and git_file_paths:
+                if self.writer is not None and self.logger_type in ["wandb", "neptune"] and git_file_paths:
                     for path in git_file_paths:
                         self.writer.save_file(path)
 
-        self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+        if self.log_dir is not None and not self.disable_logs:
+            self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         """Log training statistics."""
-        self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
+        collection_size = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
+        self.tot_timesteps += collection_size
         self.tot_time += locs["collection_time"] + locs["learn_time"]
         iteration_time = locs["collection_time"] + locs["learn_time"]
 
@@ -265,10 +283,12 @@ class OnPolicyRunner:
                     infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
                 value = torch.mean(infotensor)
                 if "/" in key:
-                    self.writer.add_scalar(key, value, locs["it"])
+                    if self.writer is not None:
+                        self.writer.add_scalar(key, value, locs["it"])
                     ep_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
                 else:
-                    self.writer.add_scalar("Episode/" + key, value, locs["it"])
+                    if self.writer is not None:
+                        self.writer.add_scalar("Episode/" + key, value, locs["it"])
                     ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
 
         # Get action std from appropriate actor-critic
@@ -277,25 +297,26 @@ class OnPolicyRunner:
         else:
             mean_std = self.alg.actor_critic.action_std.mean()
 
-        fps = int(self.num_steps_per_env * self.env.num_envs / (locs["collection_time"] + locs["learn_time"]))
+        fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
 
-        self.writer.add_scalar("Loss/value_function", locs["mean_value_loss"], locs["it"])
-        self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])
-        if self.is_mdpo and locs["mean_kl_divergence"] is not None:
-            self.writer.add_scalar("Loss/kl_divergence", locs["mean_kl_divergence"], locs["it"])
-        self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
-        self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
-        self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
-        self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
-        self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
-        if len(locs["rewbuffer"]) > 0:
-            self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
-            self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
-            if self.logger_type != "wandb":
-                self.writer.add_scalar("Train/mean_reward/time", statistics.mean(locs["rewbuffer"]), self.tot_time)
-                self.writer.add_scalar(
-                    "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
-                )
+        if self.writer is not None:
+            self.writer.add_scalar("Loss/value_function", locs["mean_value_loss"], locs["it"])
+            self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])
+            if self.is_mdpo and locs["mean_kl_divergence"] is not None:
+                self.writer.add_scalar("Loss/kl_divergence", locs["mean_kl_divergence"], locs["it"])
+            self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
+            self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
+            self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
+            self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
+            self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
+            if len(locs["rewbuffer"]) > 0:
+                self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
+                self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
+                if self.logger_type != "wandb":
+                    self.writer.add_scalar("Train/mean_reward/time", statistics.mean(locs["rewbuffer"]), self.tot_time)
+                    self.writer.add_scalar(
+                        "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
+                    )
 
         log_str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
 
@@ -355,7 +376,7 @@ class OnPolicyRunner:
             saved_dict["critic_obs_norm_state_dict"] = self.critic_obs_normalizer.state_dict()
         torch.save(saved_dict, path)
 
-        if self.logger_type in ["neptune", "wandb"]:
+        if self.writer is not None and self.logger_type in ["neptune", "wandb"]:
             self.writer.save_model(path, self.current_learning_iteration)
 
     def load(self, path, load_optimizer=True):
@@ -462,3 +483,41 @@ class OnPolicyRunner:
             if self.video_recorder:
                 self.video_recorder.disable()
             self.video_recorder = None
+
+    def _configure_multi_gpu(self):
+        """Configure distributed multi-gpu training."""
+        self.gpu_world_size = int(os.getenv("WORLD_SIZE", "1"))
+        self.is_distributed = self.gpu_world_size > 1
+
+        if not self.is_distributed:
+            self.gpu_local_rank = 0
+            self.gpu_global_rank = 0
+            self.multi_gpu_cfg = None
+            return
+
+        self.gpu_local_rank = int(os.getenv("LOCAL_RANK", "0"))
+        self.gpu_global_rank = int(os.getenv("RANK", "0"))
+
+        self.multi_gpu_cfg = {
+            "global_rank": self.gpu_global_rank,
+            "local_rank": self.gpu_local_rank,
+            "world_size": self.gpu_world_size,
+        }
+
+        if self.device != f"cuda:{self.gpu_local_rank}":
+            raise ValueError(
+                f"Device '{self.device}' does not match expected device for local rank '{self.gpu_local_rank}'."
+            )
+        if self.gpu_local_rank >= self.gpu_world_size:
+            raise ValueError(
+                f"Local rank '{self.gpu_local_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
+            )
+        if self.gpu_global_rank >= self.gpu_world_size:
+            raise ValueError(
+                f"Global rank '{self.gpu_global_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
+            )
+
+        torch.distributed.init_process_group(
+            backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size
+        )
+        torch.cuda.set_device(self.gpu_local_rank)
