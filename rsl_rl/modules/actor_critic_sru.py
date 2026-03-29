@@ -61,6 +61,7 @@ class ActorCriticSRU(nn.Module):
         dropout: float = 0.2,
         rnn_hidden_size: int = 256,
         rnn_num_layers: int = 1,
+        memory_variant: str = "baseline",
         time_embed_dim: int = 8,
         num_cameras: int = 1,
         **kwargs,
@@ -131,11 +132,13 @@ class ActorCriticSRU(nn.Module):
             input_size=self.mlp_input_dim_actor,
             num_layers=rnn_num_layers,
             hidden_size=rnn_hidden_size,
+            memory_variant=memory_variant,
         )
         self.memory_c = MemorySRU(
             input_size=self.mlp_input_dim_critic,
             num_layers=rnn_num_layers,
             hidden_size=rnn_hidden_size,
+            memory_variant=memory_variant,
         )
 
         # Time embedding layer for critic
@@ -751,14 +754,25 @@ class MemorySRU(torch.nn.Module):
         hidden_size: Hidden state size.
     """
 
-    def __init__(self, input_size: int, num_layers: int = 1, hidden_size: int = 256):
+    def __init__(
+        self,
+        input_size: int,
+        num_layers: int = 1,
+        hidden_size: int = 256,
+        memory_variant: str = "baseline",
+    ):
         super().__init__()
-        print(f"[MemorySRU] Init: input_size={input_size}, num_layers={num_layers}, hidden_size={hidden_size}")
+        print(
+            "[MemorySRU] Init: "
+            f"input_size={input_size}, num_layers={num_layers}, hidden_size={hidden_size}, "
+            f"memory_variant={memory_variant}"
+        )
 
         self.rnn = LSTM_SRU(
             input_size=input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
+            cell_variant=memory_variant,
         )
         self.hidden_states = None
 

@@ -16,11 +16,21 @@ class LSTMSRUCell(nn.Module):
     https://proceedings.mlr.press/v119/gu20a/gu20a.pdf
     """
 
-    def __init__(self, input_size: int, hidden_size: int, bias: bool = True) -> None:
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        bias: bool = True,
+        cell_variant: str = "baseline",
+    ) -> None:
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.bias = bias
+        self.cell_variant = cell_variant
+
+        if self.cell_variant not in {"baseline", "dual_gated"}:
+            raise ValueError(f"Unsupported cell_variant: {self.cell_variant}")
 
         # Combined linear layer for all gates
         self.linear_all = nn.Linear(input_size + hidden_size, 4 * hidden_size, bias=bias)
@@ -32,26 +42,38 @@ class LSTMSRUCell(nn.Module):
         if bias:
             self.linear_all.bias.data[hidden_size : 2 * hidden_size] = 1.0 + torch.randn(hidden_size)
 
-        # Transformation Gate
-        self.transform_gate = nn.Linear(input_size, hidden_size, bias=bias)
-
-        # Initialize transform gate weights to orthogonal
-        nn.init.orthogonal_(self.transform_gate.weight)
+        if self.cell_variant == "baseline":
+            # Original SRU-style spatial modulation from the current input only.
+            self.transform_gate = nn.Linear(input_size, hidden_size, bias=bias)
+            nn.init.orthogonal_(self.transform_gate.weight)
+        else:
+            # Dual-gated spatial modulation conditions both gates on input and history.
+            self.spatial_gate = nn.Linear(input_size + hidden_size, hidden_size, bias=bias)
+            self.control_gate = nn.Linear(input_size + hidden_size, hidden_size, bias=bias)
+            nn.init.orthogonal_(self.spatial_gate.weight)
+            nn.init.orthogonal_(self.control_gate.weight)
 
     def forward(self, x: torch.Tensor, h: torch.Tensor, c: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # concatenate input and hidden state
         combined = torch.cat([x, h], dim=1)
 
-        # Compute all gates in a single linear transformation, and transform gate
+        # Compute all gates in a single linear transformation.
         gates = self.linear_all(combined)
-        tx = self.transform_gate(x)
 
         # Split gates into input, forget, cell, and output
         i, f, o, g = torch.split(gates, self.hidden_size, dim=1)
         i = torch.sigmoid(i)
         f = torch.sigmoid(f)
         o = torch.sigmoid(o)
-        g_t = torch.tanh(tx * g)
+        if self.cell_variant == "baseline":
+            tx = self.transform_gate(x)
+            g_t = torch.tanh(tx * g)
+        else:
+            s_t = torch.tanh(self.spatial_gate(combined))
+            z_t = torch.sigmoid(self.control_gate(combined))
+            g_candidate = torch.tanh(g)
+            g_spatial = s_t * g_candidate
+            g_t = z_t * g_candidate + (1.0 - z_t) * g_spatial
 
         # Refine Gate: https://proceedings.mlr.press/v119/gu20a/gu20a.pdf
         f = i * (1.0 - (1.0 - f) ** 2) + (1.0 - i) * f**2
@@ -75,14 +97,29 @@ class LSTM_SRU(nn.Module):
             Default: False.
     """
 
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1, batch_first: bool = False) -> None:
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        num_layers: int = 1,
+        batch_first: bool = False,
+        cell_variant: str = "baseline",
+    ) -> None:
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.batch_first = batch_first
+        self.cell_variant = cell_variant
         self.cells = nn.ModuleList(
-            [LSTMSRUCell(input_size if i == 0 else hidden_size, hidden_size) for i in range(num_layers)]
+            [
+                LSTMSRUCell(
+                    input_size if i == 0 else hidden_size,
+                    hidden_size,
+                    cell_variant=cell_variant,
+                )
+                for i in range(num_layers)
+            ]
         )
 
     def forward(self, x, state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
